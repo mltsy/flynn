@@ -87,7 +87,11 @@ func (m *Mux) StreamToAggregators(s discoverd.Service) error {
 				continue
 			}
 			l.Info("connecting to new aggregator", "addr", e.Instance.Addr)
-			go m.addAggregator(e.Instance.Addr)
+			s, err := NewLogAggregatorSink(e.Instance.Addr)
+			if err != nil {
+				l.Error("failed to connect to aggregator", "addr", e.Instance.Addr)
+			}
+			go m.addSink(s)
 		}
 	}()
 	return nil
@@ -127,23 +131,82 @@ func (m *Mux) broadcast(app string, msg message) {
 	}
 }
 
-func (m *Mux) addAggregator(addr string) {
-	l := m.logger.New("fn", "addAggregator", "addr", addr)
+type Sink interface {
+	GetCursors() (map[string]utils.HostCursor, error)
+	Write(m message) error
+	Close()
+}
+
+type LogAggregatorSink struct {
+	conn             net.Conn
+	aggregatorClient *client.Client
+}
+
+func NewLogAggregatorSink(addr string) (*LogAggregatorSink, error) {
+	// Connect TCP connection to aggregator
 	// TODO(titanous): add dial timeout
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		l.Error("failed to connect to aggregator", "error", err)
-		return
+		return nil, err
 	}
-	l.Info("connected to aggregator")
 
+	// Connect to logaggregator HTTP endpoint
 	host, _, _ := net.SplitHostPort(addr)
-	c, _ := client.New("http://" + host)
-	cursors, err := c.GetCursors()
+	c, err := client.New("http://" + host)
+	if err != nil {
+		return nil, err
+	}
+	return &LogAggregatorSink{conn: conn, aggregatorClient: c}, nil
+}
+
+func (s *LogAggregatorSink) GetCursors() (map[string]utils.HostCursor, error) {
+	return s.aggregatorClient.GetCursors()
+}
+
+func (s *LogAggregatorSink) Write(m message) error {
+	_, err := s.conn.Write(rfc6587.Bytes(m.Message))
+	return err
+}
+
+func (s *LogAggregatorSink) Close() {
+	s.conn.Close()
+}
+
+// TODO(jpg) work out how to track cursors locally, boltdb perhaps?
+// work out how to deal with TLS, probably have config object in controller
+// with CA certs that need to be trusted etc, how does this fit with Go TLS stack
+type RSyslogSink struct {
+}
+
+func NewRSyslogSink(addr string) (*RSyslogSink, error) {
+	// If we accept a addr with protocol we could feasibly support UDP/TCP/TLS
+	return &RSyslogSink{}, nil
+}
+
+func (s *RSyslogSink) GetCursors() (map[string]utils.HostCursor, error) {
+	// read cursors from disk
+	return nil, nil
+}
+
+func (s *RSyslogSink) Write(m message) error {
+	// write message to remote rsyslog and update cursor on disk
+	// format message, we need to strip newlines as syslog TCP/TLS format
+	// is line based.
+	// need to have a quick think about priority (severity/facility)
+	// probably end up encoding everything as local0/info though.
+	return nil
+}
+
+func (s *RSyslogSink) Close() {
+}
+
+func (m *Mux) addSink(sink Sink) {
+	l := m.logger.New("fn", "addSink")
+	cursors, err := sink.GetCursors()
 	if err != nil {
 		// TODO(titanous): retry
-		l.Error("failed to get cursors from aggregator", "error", err)
-		conn.Close()
+		l.Error("failed to get cursors from sink", "error", err)
+		sink.Close()
 		return
 	}
 
@@ -160,7 +223,7 @@ func (m *Mux) addAggregator(addr string) {
 	appLogs, err := m.logFiles("")
 	if err != nil {
 		l.Error("failed to get local log files", "error", err)
-		conn.Close()
+		sink.Close()
 		return
 	}
 
@@ -174,20 +237,22 @@ func (m *Mux) addAggregator(addr string) {
 	bufferCursors := make(map[string]utils.HostCursor)
 	var bufferCursorsMtx sync.Mutex
 	go func() {
-		l := m.logger.New("fn", "sendToAggregator", "addr", addr)
+		l := m.logger.New("fn", "sendToSink")
 		defer unsubscribe()
-		defer conn.Close()
+		defer sink.Close()
 		defer close(done)
 		bm := bufferedMessages // make a copy so we can nil it later
 		for {
 			var m message
 			var ok bool
 			select {
+			// first drain the list of buffered messages
 			case m, ok = <-bm:
 				if !ok {
 					bm = nil
 					continue
 				}
+			// then consume from the firehose
 			case m, ok = <-firehose:
 				if !ok {
 					return
@@ -207,8 +272,9 @@ func (m *Mux) addAggregator(addr string) {
 			if string(m.MsgID) == "ID3" {
 				continue
 			}
-			if _, err := conn.Write(rfc6587.Bytes(m.Message)); err != nil {
-				l.Error("failed to write message", "error", err)
+			// Send message to sink
+			if err := sink.Write(m); err != nil {
+				l.Error("failed to write message to sink", "error", err)
 				return
 			}
 		}
